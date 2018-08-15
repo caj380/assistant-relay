@@ -8,6 +8,10 @@ const GRConfig = require('./config.json');
 const async = require('async');
 const ip = require('ip')
 
+const fs = require('fs');
+const shortid = require('shortid');
+const FileWriter = require('wav').FileWriter;
+const waitUntil = require('wait-until');
 
 //Define SSDP Server Configuration
 const ssdpServer = new SSDP({
@@ -21,15 +25,29 @@ const authKeys = GRConfig.users;
 const config = {
   conversation: {
     lang: GRConfig.language,
+    audio: {
+      sampleRateOut: 24000, // defaults to 24000
+    },
+    lang: 'en-US', // defaults to en-US, but try other ones, it's fun!
   },
   users: {},
   assistants: {},
   port: GRConfig.port
 }
 
+let running
+let audioFile
+let tmpdir
+
 const defaultAudio = false;
+let returnAudioFile = false;
 let returnAudio;
 let assistant;
+
+tmpdir = path.resolve(__dirname, "tmp/")
+if(!fs.existsSync(tmpdir)){
+  fs.mkdir(tmpdir)
+}
 
 if(Object.keys(authKeys).length === 0){
   return console.log('No users configured, exiting..');
@@ -54,19 +72,67 @@ ssdpServer.start(function(){
 });
 
 // Endpoint API
-app.post('/custom', function (req, res) {
+app.all('/custom', function (req, res) {
   const converse = req.query.converse;
   const command = req.query.command;
   const user = req.query.user;
 
+  const audio = req.query.audio;
+
   //Check the converse parameter
   if(converse) returnAudio = true;
 
-  sendTextInput(command, user)
-  res.status(200).json({
-      message: `Custom command executed`,
-      command: `${command}`
-  });
+  if(audio) {
+    returnAudioFile = true
+	audioFile = path.resolve(tmpdir, shortid.generate() + '.wav')
+    running = true
+    sendTextInput(command, user)
+    waitUntil()
+      .interval(500)
+      .times(Infinity)
+      .condition(function() {
+          return (!running);
+      })
+      .done(function(result) {
+          res.sendFile(audioFile)
+		  setTimeout(function() {
+  		    fs.unlink(audioFile, (err) => {
+              if (err) console.log(err);
+            });
+		  }, 3000);
+      });
+  }
+  else {
+    sendTextInput(command, user)
+    res.status(200).json({
+        message: `Custom command executed`,
+        command: `${command}`
+    });
+  };
+})
+
+app.get('/tts', function (req, res) {
+  const text = req.query.text;
+  const user = req.query.user;
+
+  returnAudioFile = true
+  audioFile = path.resolve(tmpdir, shortid.generate() + '.wav')
+  running = true
+  sendTextInput(`repeat after me ${text}`, user)
+  waitUntil()
+    .interval(500)
+    .times(Infinity)
+    .condition(function() {
+        return (!running);
+    })
+    .done(function(result) {
+          res.sendFile(audioFile)
+		  setTimeout(function() {
+  		    fs.unlink(audioFile, (err) => {
+              if (err) console.log(err);
+            });
+		  }, 3000);
+      });
 })
 
 app.post('/customBroadcast', function (req, res) {
@@ -182,7 +248,7 @@ async.forEachOfLimit(config.users, 1, function(i, k, cb){
 }, function(err){
   if(err) return console.log(err.message);
   console.log(`Assistant Relay is now setup and running for ${users}`)
-  sendTextInput(`broadcast Assistant Relay is now setup and running for ${users}`)
+  //sendTextInput(`broadcast Assistant Relay is now setup and running for ${users}`)
 })
 
 function checkUser(user) {
@@ -196,6 +262,11 @@ function checkUser(user) {
 function startConversation(conversation) {
   conversation
     //.on('audio-data', data => console.log('Got some audio data'))
+    .on('audio-data', (data) => {
+      if(returnAudioFile) {
+        outputFileStream.write(data);
+      }
+    })
     .on('response', (text) => {
       if (text) {
         console.log('Google Assistant:', text)
@@ -219,13 +290,23 @@ function startConversation(conversation) {
         //console.log('Support for Actions on Google are not yet supported by Assistant Relay');
         conversation.end();
       } else {
+        console.log('Assistant Finished Speaking');
+        if(returnAudioFile) {outputFileStream.end();}
         //console.log('Conversation Complete');
         conversation.end();
+        running = false;
       }
     })
     .on('error', (error) => {
       console.log('Conversation Error:', error);
     });
+
+    if(returnAudioFile) {
+      var outputFileStream = new FileWriter(audioFile, {
+        sampleRate: config.conversation.audio.sampleRateOut,
+        channels: 1
+      });
+    }
 }
 
 function sendTextInput(text, n) {
